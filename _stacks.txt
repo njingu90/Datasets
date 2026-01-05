@@ -1280,3 +1280,112 @@ create_test_role = false
 ```
 
 This Terraform configuration is production-ready and includes proper dependencies, tags, and best practices!
+======================================================================================================================================
+echo "Creating Lambda function..."
+
+cat > /tmp/lambda_function.py <<'EOF'
+import boto3
+import json
+from datetime import datetime, timedelta
+import os
+
+def lambda_handler(event, context):
+    # Initialize clients
+    cloudtrail = boto3.client('cloudtrail')
+    sns = boto3.client('sns')
+    
+    # Get environment variables
+    sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+    target_role_name = os.environ['TARGET_ROLE_NAME']
+    
+    print(f"Checking for AssumeRole events for role: {target_role_name}")
+    
+    # Query CloudTrail for AssumeRole events in the last 5 minutes
+    try:
+        response = cloudtrail.lookup_events(
+            LookupAttributes=[
+                {
+                    'AttributeKey': 'EventName',
+                    'AttributeValue': 'AssumeRole'
+                }
+            ],
+            StartTime=datetime.now() - timedelta(minutes=5),
+            EndTime=datetime.now(),
+            MaxResults=50
+        )
+        
+        alerts = []
+        
+        # Process events
+        for event in response.get('Events', []):
+            event_data = json.loads(event['CloudTrailEvent'])
+            role_arn = event_data.get('requestParameters', {}).get('roleArn', '')
+            
+            # Check if this is the role we're monitoring
+            if target_role_name in role_arn:
+                # Extract relevant information
+                alert_info = {
+                    'event_time': event['EventTime'].strftime('%Y-%m-%d %H:%M:%S UTC'),
+                    'username': event_data.get('userIdentity', {}).get('userName', 'N/A'),
+                    'principal_id': event_data.get('userIdentity', {}).get('principalId', 'N/A'),
+                    'role_arn': role_arn,
+                    'source_ip': event_data.get('sourceIPAddress', 'N/A'),
+                    'user_agent': event_data.get('userAgent', 'N/A'),
+                    'session_name': event_data.get('requestParameters', {}).get('roleSessionName', 'N/A')
+                }
+                
+                alerts.append(alert_info)
+                print(f"Alert detected: {json.dumps(alert_info, indent=2)}")
+        
+        # Send alerts if any found
+        if alerts:
+            message = format_alert_message(alerts)
+            
+            sns.publish(
+                TopicArn=sns_topic_arn,
+                Subject=f'🚨 AssumeRole Alert: {target_role_name}',
+                Message=message
+            )
+            
+            print(f"Sent {len(alerts)} alerts to SNS")
+            return {
+                'statusCode': 200,
+                'body': json.dumps(f'Processed {len(alerts)} alerts')
+            }
+        else:
+            print("No matching AssumeRole events found")
+            return {
+                'statusCode': 200,
+                'body': json.dumps('No alerts found')
+            }
+            
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        raise
+
+def format_alert_message(alerts):
+    """Format alerts into a readable message"""
+    
+    message = f"⚠️  SECURITY ALERT: AssumeRole Event Detected\n\n"
+    message += f"Total Events: {len(alerts)}\n"
+    message += "="*60 + "\n\n"
+    
+    for i, alert in enumerate(alerts, 1):
+        message += f"Event #{i}\n"
+        message += f"  Event Time:    {alert['event_time']}\n"
+        message += f"  Username:      {alert['username']}\n"
+        message += f"  Principal ID:  {alert['principal_id']}\n"
+        message += f"  Role ARN:      {alert['role_arn']}\n"
+        message += f"  Source IP:     {alert['source_ip']}\n"
+        message += f"  User Agent:    {alert['user_agent']}\n"
+        message += f"  Session Name:  {alert['session_name']}\n"
+        message += "-"*60 + "\n\n"
+    
+    return message
+EOF
+
+# Package Lambda function
+cd /tmp
+zip lambda_function.zip lambda_function.py
+
+LAMBDA_FUNCTION_NAME="${PREFIX}_m
