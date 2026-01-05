@@ -539,3 +539,744 @@ CLOUDTRAIL_ROLE_NAME=$CLOUDTRAIL_ROLE_NAME
 EOF
 
 echo "Configuration saved to /tmp/poc-config.txt"
+
+=======================================================================================================================
+Here's the complete Terraform configuration for your CloudTrail monitoring POC:
+
+```hcl
+# variables.tf
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "alert_email" {
+  description = "Email address for security alerts"
+  type        = string
+  default     = "mail@kecynji.com"
+}
+
+variable "target_role_name" {
+  description = "Name of the IAM role to monitor"
+  type        = string
+  default     = "CLOUDDEVADMINROLE"
+}
+
+variable "prefix" {
+  description = "Prefix for resource names"
+  type        = string
+  default     = "cloud-alerts"
+}
+
+variable "create_test_role" {
+  description = "Whether to create a test IAM role"
+  type        = bool
+  default     = false
+}
+```
+
+```hcl
+# main.tf
+terraform {
+  required_version = ">= 1.0"
+  
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+    archive = {
+      source  = "hashicorp/archive"
+      version = "~> 2.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+
+# Get current AWS account ID
+data "aws_caller_identity" "current" {}
+
+# Get current AWS region
+data "aws_region" "current" {}
+```
+
+```hcl
+# sns.tf
+# SNS Topic for alerts
+resource "aws_sns_topic" "security_alerts" {
+  name = "${var.prefix}_security_alerts"
+
+  tags = {
+    Name        = "${var.prefix}_security_alerts"
+    Environment = "poc"
+    ManagedBy   = "terraform"
+  }
+}
+
+# SNS Topic Subscription
+resource "aws_sns_topic_subscription" "email_subscription" {
+  topic_arn = aws_sns_topic.security_alerts.arn
+  protocol  = "email"
+  endpoint  = var.alert_email
+}
+
+# SNS Topic Policy
+resource "aws_sns_topic_policy" "security_alerts_policy" {
+  arn = aws_sns_topic.security_alerts.arn
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowLambdaPublish"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+        Action   = "SNS:Publish"
+        Resource = aws_sns_topic.security_alerts.arn
+      }
+    ]
+  })
+}
+```
+
+```hcl
+# s3.tf
+# S3 Bucket for CloudTrail logs
+resource "aws_s3_bucket" "cloudtrail_logs" {
+  bucket = "${data.aws_caller_identity.current.account_id}-cloudtrail-logs-${var.prefix}"
+
+  tags = {
+    Name        = "CloudTrail Logs"
+    Environment = "poc"
+    ManagedBy   = "terraform"
+  }
+}
+
+# S3 Bucket Policy for CloudTrail
+resource "aws_s3_bucket_policy" "cloudtrail_logs_policy" {
+  bucket = aws_s3_bucket.cloudtrail_logs.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AWSCloudTrailAclCheck"
+        Effect = "Allow"
+        Principal = {
+          Service = "cloudtrail.amazonaws.com"
+        }
+        Action   = "s3:GetBucketAcl"
+        Resource = aws_s3_bucket.cloudtrail_logs.arn
+      },
+      {
+        Sid    = "AWSCloudTrailWrite"
+        Effect = "Allow"
+        Principal = {
+          Service = "cloudtrail.amazonaws.com"
+        }
+        Action   = "s3:PutObject"
+        Resource = "${aws_s3_bucket.cloudtrail_logs.arn}/AWSLogs/${data.aws_caller_identity.current.account_id}/*"
+        Condition = {
+          StringEquals = {
+            "s3:x-amz-acl" = "bucket-owner-full-control"
+          }
+        }
+      }
+    ]
+  })
+}
+
+# Enable versioning (optional but recommended)
+resource "aws_s3_bucket_versioning" "cloudtrail_logs_versioning" {
+  bucket = aws_s3_bucket.cloudtrail_logs.id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+```
+
+```hcl
+# cloudwatch.tf
+# CloudWatch Log Group for CloudTrail
+resource "aws_cloudwatch_log_group" "cloudtrail_logs" {
+  name              = "/aws/cloudtrail/${var.prefix}_logs"
+  retention_in_days = 7 # Adjust as needed
+
+  tags = {
+    Name        = "CloudTrail Logs"
+    Environment = "poc"
+    ManagedBy   = "terraform"
+  }
+}
+```
+
+```hcl
+# iam_cloudtrail.tf
+# IAM Role for CloudTrail to write to CloudWatch Logs
+resource "aws_iam_role" "cloudtrail_cloudwatch" {
+  name = "${var.prefix}_cloudtrail_role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "cloudtrail.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = {
+    Name        = "CloudTrail CloudWatch Role"
+    Environment = "poc"
+    ManagedBy   = "terraform"
+  }
+}
+
+# IAM Policy for CloudTrail to write to CloudWatch Logs
+resource "aws_iam_role_policy" "cloudtrail_cloudwatch_policy" {
+  name = "CloudTrailCloudWatchLogsPolicy"
+  role = aws_iam_role.cloudtrail_cloudwatch.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "${aws_cloudwatch_log_group.cloudtrail_logs.arn}:*"
+      }
+    ]
+  })
+}
+```
+
+```hcl
+# cloudtrail.tf
+# CloudTrail
+resource "aws_cloudtrail" "main" {
+  name                          = "${var.prefix}_trail"
+  s3_bucket_name               = aws_s3_bucket.cloudtrail_logs.id
+  include_global_service_events = true
+  is_multi_region_trail        = true
+  enable_logging               = true
+
+  cloud_watch_logs_group_arn = "${aws_cloudwatch_log_group.cloudtrail_logs.arn}:*"
+  cloud_watch_logs_role_arn  = aws_iam_role.cloudtrail_cloudwatch.arn
+
+  event_selector {
+    read_write_type           = "All"
+    include_management_events = true
+  }
+
+  tags = {
+    Name        = "CloudTrail Main"
+    Environment = "poc"
+    ManagedBy   = "terraform"
+  }
+
+  depends_on = [
+    aws_s3_bucket_policy.cloudtrail_logs_policy,
+    aws_iam_role_policy.cloudtrail_cloudwatch_policy
+  ]
+}
+```
+
+```hcl
+# iam_test_role.tf (optional)
+# Test IAM Role (only created if create_test_role is true)
+resource "aws_iam_role" "test_role" {
+  count = var.create_test_role ? 1 : 0
+  name  = var.target_role_name
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = {
+    Name        = "Test Role for Monitoring"
+    Environment = "poc"
+    ManagedBy   = "terraform"
+  }
+}
+
+# Attach ReadOnlyAccess policy to test role
+resource "aws_iam_role_policy_attachment" "test_role_policy" {
+  count      = var.create_test_role ? 1 : 0
+  role       = aws_iam_role.test_role[0].name
+  policy_arn = "arn:aws:iam::aws:policy/ReadOnlyAccess"
+}
+```
+
+```hcl
+# iam_lambda.tf
+# IAM Role for Lambda
+resource "aws_iam_role" "lambda_execution" {
+  name = "${var.prefix}_lambda_role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+
+  tags = {
+    Name        = "Lambda Execution Role"
+    Environment = "poc"
+    ManagedBy   = "terraform"
+  }
+}
+
+# Attach basic Lambda execution policy
+resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
+  role       = aws_iam_role.lambda_execution.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# Custom policy for Lambda to publish to SNS and read CloudWatch Logs
+resource "aws_iam_role_policy" "lambda_custom_policy" {
+  name = "CloudTrailSNSPolicy"
+  role = aws_iam_role.lambda_execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "sns:Publish"
+        ]
+        Resource = aws_sns_topic.security_alerts.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:FilterLogEvents"
+        ]
+        Resource = "${aws_cloudwatch_log_group.cloudtrail_logs.arn}:*"
+      }
+    ]
+  })
+}
+```
+
+```hcl
+# lambda.tf
+# Lambda function code
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  output_path = "${path.module}/lambda_function.zip"
+
+  source {
+    content  = file("${path.module}/lambda_function.py")
+    filename = "lambda_function.py"
+  }
+}
+
+# Lambda Function
+resource "aws_lambda_function" "eventbridge_monitor" {
+  filename         = data.archive_file.lambda_zip.output_path
+  function_name    = "${var.prefix}_eventbridge_monitor"
+  role            = aws_iam_role.lambda_execution.arn
+  handler         = "lambda_function.lambda_handler"
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  runtime         = "python3.11"
+  timeout         = 30
+  memory_size     = 256
+
+  environment {
+    variables = {
+      SNS_TOPIC_ARN    = aws_sns_topic.security_alerts.arn
+      TARGET_ROLE_NAME = var.target_role_name
+    }
+  }
+
+  tags = {
+    Name        = "CloudTrail EventBridge Monitor"
+    Environment = "poc"
+    ManagedBy   = "terraform"
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.lambda_basic_execution,
+    aws_iam_role_policy.lambda_custom_policy
+  ]
+}
+
+# CloudWatch Log Group for Lambda
+resource "aws_cloudwatch_log_group" "lambda_logs" {
+  name              = "/aws/lambda/${aws_lambda_function.eventbridge_monitor.function_name}"
+  retention_in_days = 7
+
+  tags = {
+    Name        = "Lambda Logs"
+    Environment = "poc"
+    ManagedBy   = "terraform"
+  }
+}
+```
+
+```hcl
+# eventbridge.tf
+# EventBridge Rule for AssumeRole events
+resource "aws_cloudwatch_event_rule" "assumerole_rule" {
+  name        = "${var.prefix}_assumerole_rule"
+  description = "Trigger on AssumeRole events for ${var.target_role_name}"
+
+  event_pattern = jsonencode({
+    source      = ["aws.sts"]
+    detail-type = ["AWS API Call via CloudTrail"]
+    detail = {
+      eventName = ["AssumeRole"]
+      requestParameters = {
+        roleArn = [{
+          wildcard = "*${var.target_role_name}*"
+        }]
+      }
+    }
+  })
+
+  tags = {
+    Name        = "AssumeRole EventBridge Rule"
+    Environment = "poc"
+    ManagedBy   = "terraform"
+  }
+}
+
+# EventBridge Target - Lambda Function
+resource "aws_cloudwatch_event_target" "lambda_target" {
+  rule      = aws_cloudwatch_event_rule.assumerole_rule.name
+  target_id = "LambdaTarget"
+  arn       = aws_lambda_function.eventbridge_monitor.arn
+}
+
+# Lambda permission for EventBridge to invoke
+resource "aws_lambda_permission" "allow_eventbridge" {
+  statement_id  = "AllowEventBridgeInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.eventbridge_monitor.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.assumerole_rule.arn
+}
+```
+
+```hcl
+# outputs.tf
+output "sns_topic_arn" {
+  description = "ARN of the SNS topic for alerts"
+  value       = aws_sns_topic.security_alerts.arn
+}
+
+output "s3_bucket_name" {
+  description = "Name of the S3 bucket for CloudTrail logs"
+  value       = aws_s3_bucket.cloudtrail_logs.id
+}
+
+output "cloudtrail_name" {
+  description = "Name of the CloudTrail"
+  value       = aws_cloudtrail.main.name
+}
+
+output "lambda_function_name" {
+  description = "Name of the Lambda function"
+  value       = aws_lambda_function.eventbridge_monitor.function_name
+}
+
+output "eventbridge_rule_name" {
+  description = "Name of the EventBridge rule"
+  value       = aws_cloudwatch_event_rule.assumerole_rule.name
+}
+
+output "test_role_arn" {
+  description = "ARN of the test role (if created)"
+  value       = var.create_test_role ? aws_iam_role.test_role[0].arn : "Not created - set create_test_role=true"
+}
+
+output "target_role_arn" {
+  description = "ARN of the role being monitored"
+  value       = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.target_role_name}"
+}
+
+output "test_command" {
+  description = "Command to test the monitoring"
+  value       = "aws sts assume-role --role-arn arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${var.target_role_name} --role-session-name poc-test-session"
+}
+
+output "lambda_logs_command" {
+  description = "Command to view Lambda logs"
+  value       = "aws logs tail /aws/lambda/${aws_lambda_function.eventbridge_monitor.function_name} --follow"
+}
+
+output "alert_email" {
+  description = "Email address for alerts (confirm subscription)"
+  value       = var.alert_email
+}
+```
+
+Now create the Lambda function file:
+
+```python
+# lambda_function.py
+import boto3
+import json
+import os
+
+def lambda_handler(event, context):
+    """
+    Triggered by EventBridge when AssumeRole event occurs
+    Handles both successful and failed (AccessDenied) attempts
+    """
+    
+    print(f"Received event: {json.dumps(event)}")
+    
+    # Initialize SNS client
+    sns = boto3.client('sns')
+    sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+    target_role_name = os.environ['TARGET_ROLE_NAME']
+    
+    # Extract CloudTrail event details
+    detail = event.get('detail', {})
+    event_name = detail.get('eventName')
+    
+    # Verify this is an AssumeRole event
+    if event_name != 'AssumeRole':
+        print(f"Ignoring non-AssumeRole event: {event_name}")
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Not an AssumeRole event')
+        }
+    
+    # Get role ARN from request parameters
+    role_arn = detail.get('requestParameters', {}).get('roleArn', '')
+    
+    # Check if this is the role we're monitoring
+    if target_role_name not in role_arn:
+        print(f"Role {role_arn} does not match target {target_role_name}")
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Role does not match target')
+        }
+    
+    # Check if this was successful or denied
+    error_code = detail.get('errorCode')
+    error_message = detail.get('errorMessage', '')
+    is_denied = error_code == 'AccessDenied'
+    
+    # Extract alert information
+    user_identity = detail.get('userIdentity', {})
+    request_params = detail.get('requestParameters', {})
+    
+    alert_info = {
+        'event_time': detail.get('eventTime', 'N/A'),
+        'event_id': detail.get('eventID', 'N/A'),
+        'account_id': detail.get('recipientAccountId', 'N/A'),
+        'region': detail.get('awsRegion', 'N/A'),
+        'username': user_identity.get('principalId', 'N/A').split(':')[-1],
+        'principal_id': user_identity.get('principalId', 'N/A'),
+        'user_type': user_identity.get('type', 'N/A'),
+        'arn': user_identity.get('arn', 'N/A'),
+        'role_arn': role_arn,
+        'session_name': request_params.get('roleSessionName', 'N/A'),
+        'source_ip': detail.get('sourceIPAddress', 'N/A'),
+        'user_agent': detail.get('userAgent', 'N/A'),
+        'status': 'DENIED' if is_denied else 'SUCCESS',
+        'error_code': error_code or 'None',
+        'error_message': error_message
+    }
+    
+    print(f"Alert triggered: {json.dumps(alert_info, indent=2)}")
+    
+    # Format and send alert
+    message = format_alert_message(alert_info, is_denied)
+    subject = f'🚨 SECURITY ALERT: {target_role_name} Assumption {"DENIED" if is_denied else "SUCCESS"}'
+    
+    try:
+        response = sns.publish(
+            TopicArn=sns_topic_arn,
+            Subject=subject,
+            Message=message
+        )
+        
+        print(f"SNS notification sent. MessageId: {response['MessageId']}")
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Alert sent successfully',
+                'role': role_arn,
+                'user': alert_info['username'],
+                'status': alert_info['status']
+            })
+        }
+        
+    except Exception as e:
+        print(f"Error sending SNS notification: {str(e)}")
+        raise
+
+def format_alert_message(alert, is_denied):
+    """Format alert into a readable message"""
+    
+    status_icon = '🔴' if is_denied else '🟢'
+    status_text = 'ACCESS DENIED' if is_denied else 'SUCCESSFUL'
+    
+    message = f"""
+{status_icon} SECURITY ALERT: IAM Role Assumption Attempt - {status_text}
+
+{"⚠️  UNAUTHORIZED ATTEMPT DETECTED!" if is_denied else "A user has assumed the monitored IAM role."}
+
+ATTEMPT STATUS:
+  Result:           {alert['status']}
+"""
+    
+    if is_denied:
+        message += f"""  Error Code:       {alert['error_code']}
+  Error Message:    {alert['error_message']}
+"""
+    
+    message += f"""
+ROLE INFORMATION:
+  Role ARN:         {alert['role_arn']}
+  Session Name:     {alert['session_name']}
+
+USER INFORMATION:
+  Username:         {alert['username']}
+  Principal ID:     {alert['principal_id']}
+  User Type:        {alert['user_type']}
+  User ARN:         {alert['arn']}
+
+EVENT DETAILS:
+  Event Time:       {alert['event_time']}
+  Event ID:         {alert['event_id']}
+  Account ID:       {alert['account_id']}
+  Region:           {alert['region']}
+  Source IP:        {alert['source_ip']}
+  User Agent:       {alert['user_agent']}
+
+ACTION REQUIRED:
+"""
+    
+    if is_denied:
+        message += """  • INVESTIGATE IMMEDIATELY - Potential unauthorized access attempt!
+  • Check if user should have access to this role
+  • Review user permissions and trust relationships
+"""
+    else:
+        message += """  • Verify this is authorized activity
+  • Review AWS CloudTrail for subsequent actions
+"""
+    
+    message += """  • Contact security team if suspicious
+
+═══════════════════════════════════════════════════════════
+This is an automated alert from AWS CloudTrail monitoring
+"""
+    
+    return message.strip()
+```
+
+## Directory Structure
+
+```
+cloudtrail-monitoring/
+├── main.tf
+├── variables.tf
+├── outputs.tf
+├── sns.tf
+├── s3.tf
+├── cloudwatch.tf
+├── iam_cloudtrail.tf
+├── iam_lambda.tf
+├── iam_test_role.tf
+├── cloudtrail.tf
+├── lambda.tf
+├── eventbridge.tf
+└── lambda_function.py
+```
+
+## Usage
+
+1. **Initialize Terraform:**
+```bash
+terraform init
+```
+
+2. **Review the plan:**
+```bash
+terraform plan
+```
+
+3. **Apply the configuration:**
+```bash
+terraform apply
+```
+
+4. **Confirm your email subscription** (check your inbox)
+
+5. **Test the monitoring:**
+```bash
+# Use the test command from outputs
+terraform output -raw test_command | bash
+```
+
+6. **View Lambda logs:**
+```bash
+terraform output -raw lambda_logs_command | bash
+```
+
+## To Create the Test Role
+
+If you want Terraform to create the test role:
+
+```bash
+terraform apply -var="create_test_role=true"
+```
+
+## Cleanup
+
+```bash
+terraform destroy
+```
+
+## Customization
+
+You can customize by creating a `terraform.tfvars` file:
+
+```hcl
+# terraform.tfvars
+aws_region       = "us-east-1"
+alert_email      = "your-email@example.com"
+target_role_name = "CLOUDDEVADMINROLE"
+prefix           = "my-alerts"
+create_test_role = false
+```
+
+This Terraform configuration is production-ready and includes proper dependencies, tags, and best practices!
