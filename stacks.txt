@@ -1,0 +1,541 @@
+#!/bin/bash
+
+# Variables
+REGION="us-east-1"
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+EMAIL="mail@kecynji.com"
+PREFIX="cloud_alerts"
+ROLE_NAME="CLOUDDEVADMINROLE"  # Updated to match your actual role name
+
+echo "Setting up CloudTrail monitoring POC..."
+echo "Account ID: $ACCOUNT_ID"
+echo "Region: $REGION"
+
+# ============================================
+# 1. Create SNS Topic and Subscribe Email
+# ============================================
+echo "Creating SNS topic..."
+
+SNS_TOPIC_ARN=$(aws sns create-topic \
+    --name ${PREFIX}_security_alerts \
+    --region $REGION \
+    --query 'TopicArn' \
+    --output text)
+
+echo "SNS Topic ARN: $SNS_TOPIC_ARN"
+
+echo "Subscribing email to SNS topic..."
+
+aws sns subscribe \
+    --topic-arn $SNS_TOPIC_ARN \
+    --protocol email \
+    --notification-endpoint $EMAIL \
+    --region $REGION
+
+echo "⚠️  CHECK YOUR EMAIL ($EMAIL) and confirm the SNS subscription!"
+read -p "Press enter after confirming the subscription..."
+
+# ============================================
+# 2. Create S3 Bucket for CloudTrail (Optional - only if you want S3 logs)
+# ============================================
+echo "Creating S3 bucket for CloudTrail logs..."
+
+BUCKET_NAME="${ACCOUNT_ID}-cloudtrail-logs-ztxcy"
+
+aws s3api create-bucket \
+    --bucket $BUCKET_NAME \
+    --region $REGION
+
+# Add bucket policy for CloudTrail
+cat > /tmp/bucket-policy.json <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Sid": "AWSCloudTrailAclCheck",
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "cloudtrail.amazonaws.com"
+            },
+            "Action": "s3:GetBucketAcl",
+            "Resource": "arn:aws:s3:::${BUCKET_NAME}"
+        },
+        {
+            "Sid": "AWSCloudTrailWrite",
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "cloudtrail.amazonaws.com"
+            },
+            "Action": "s3:PutObject",
+            "Resource": "arn:aws:s3:::${BUCKET_NAME}/AWSLogs/${ACCOUNT_ID}/*",
+            "Condition": {
+                "StringEquals": {
+                    "s3:x-amz-acl": "bucket-owner-full-control"
+                }
+            }
+        }
+    ]
+}
+EOF
+
+aws s3api put-bucket-policy \
+    --bucket $BUCKET_NAME \
+    --policy file:///tmp/bucket-policy.json
+
+echo "S3 bucket created: $BUCKET_NAME"
+
+# ============================================
+# 3. Create CloudWatch Log Group
+# ============================================
+echo "Creating CloudWatch Log Group..."
+
+LOG_GROUP_NAME="/aws/cloudtrail/${PREFIX}_logs"
+
+aws logs create-log-group \
+    --log-group-name $LOG_GROUP_NAME \
+    --region $REGION
+
+echo "CloudWatch Log Group created: $LOG_GROUP_NAME"
+
+# ============================================
+# 4. Create IAM Role for CloudTrail to CloudWatch
+# ============================================
+echo "Creating IAM role for CloudTrail..."
+
+cat > /tmp/cloudtrail-trust-policy.json <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "cloudtrail.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+        }
+    ]
+}
+EOF
+
+CLOUDTRAIL_ROLE_NAME="${PREFIX}_cloudtrail_role"
+
+aws iam create-role \
+    --role-name $CLOUDTRAIL_ROLE_NAME \
+    --assume-role-policy-document file:///tmp/cloudtrail-trust-policy.json
+
+CLOUDTRAIL_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${CLOUDTRAIL_ROLE_NAME}"
+
+# Create and attach policy for CloudWatch Logs
+cat > /tmp/cloudtrail-cloudwatch-policy.json <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:CreateLogStream",
+                "logs:PutLogEvents"
+            ],
+            "Resource": "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${LOG_GROUP_NAME}:*"
+        }
+    ]
+}
+EOF
+
+aws iam put-role-policy \
+    --role-name $CLOUDTRAIL_ROLE_NAME \
+    --policy-name CloudTrailCloudWatchLogsPolicy \
+    --policy-document file:///tmp/cloudtrail-cloudwatch-policy.json
+
+echo "Waiting 10 seconds for IAM role to propagate..."
+sleep 10
+
+# ============================================
+# 5. Create CloudTrail
+# ============================================
+echo "Creating CloudTrail..."
+
+TRAIL_NAME="${PREFIX}_trail"
+
+aws cloudtrail create-trail \
+    --name $TRAIL_NAME \
+    --s3-bucket-name $BUCKET_NAME \
+    --cloud-watch-logs-log-group-arn "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${LOG_GROUP_NAME}:*" \
+    --cloud-watch-logs-role-arn $CLOUDTRAIL_ROLE_ARN \
+    --is-multi-region-trail \
+    --include-global-service-events \
+    --region $REGION
+
+# Start logging
+aws cloudtrail start-logging \
+    --name $TRAIL_NAME \
+    --region $REGION
+
+echo "CloudTrail created and started: $TRAIL_NAME"
+
+# ============================================
+# 6. Create Test IAM Role (ONLY if it doesn't exist)
+# ============================================
+echo "Checking if role $ROLE_NAME exists..."
+
+if aws iam get-role --role-name $ROLE_NAME 2>/dev/null; then
+    echo "✓ Role $ROLE_NAME already exists, skipping creation"
+    TEST_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+else
+    echo "Creating test role: $ROLE_NAME"
+    
+    cat > /tmp/test-role-trust-policy.json <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "arn:aws:iam::${ACCOUNT_ID}:root"
+            },
+            "Action": "sts:AssumeRole"
+        }
+    ]
+}
+EOF
+
+    aws iam create-role \
+        --role-name $ROLE_NAME \
+        --assume-role-policy-document file:///tmp/test-role-trust-policy.json
+
+    # Attach a basic policy (ReadOnlyAccess for testing)
+    aws iam attach-role-policy \
+        --role-name $ROLE_NAME \
+        --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess
+
+    TEST_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+    echo "Test role created: $TEST_ROLE_ARN"
+fi
+
+# ============================================
+# 7. Create Lambda Execution Role
+# ============================================
+echo "Creating Lambda execution role..."
+
+LAMBDA_ROLE_NAME="${PREFIX}_lambda_role"
+
+cat > /tmp/lambda-trust-policy.json <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "lambda.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+        }
+    ]
+}
+EOF
+
+aws iam create-role \
+    --role-name $LAMBDA_ROLE_NAME \
+    --assume-role-policy-document file:///tmp/lambda-trust-policy.json
+
+LAMBDA_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/${LAMBDA_ROLE_NAME}"
+
+# Attach policies
+aws iam attach-role-policy \
+    --role-name $LAMBDA_ROLE_NAME \
+    --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+# Create custom policy for SNS
+cat > /tmp/lambda-custom-policy.json <<EOF
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "sns:Publish"
+            ],
+            "Resource": "${SNS_TOPIC_ARN}"
+        },
+        {
+            "Effect": "Allow",
+            "Action": [
+                "logs:FilterLogEvents"
+            ],
+            "Resource": "arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${LOG_GROUP_NAME}:*"
+        }
+    ]
+}
+EOF
+
+aws iam put-role-policy \
+    --role-name $LAMBDA_ROLE_NAME \
+    --policy-name CloudTrailSNSPolicy \
+    --policy-document file:///tmp/lambda-custom-policy.json
+
+echo "Waiting 15 seconds for Lambda IAM role to propagate..."
+sleep 15
+
+# ============================================
+# 8. Create Lambda Function (EventBridge-triggered)
+# ============================================
+echo "Creating Lambda function for EventBridge..."
+
+cat > /tmp/lambda_function.py <<'EOF'
+import boto3
+import json
+import os
+
+def lambda_handler(event, context):
+    """
+    Triggered by EventBridge when AssumeRole event occurs
+    Event structure comes directly from CloudTrail via EventBridge
+    """
+    
+    print(f"Received event: {json.dumps(event)}")
+    
+    # Initialize SNS client
+    sns = boto3.client('sns')
+    sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+    target_role_name = os.environ['TARGET_ROLE_NAME']
+    
+    # Extract CloudTrail event details
+    detail = event.get('detail', {})
+    event_name = detail.get('eventName')
+    
+    # Verify this is an AssumeRole event
+    if event_name != 'AssumeRole':
+        print(f"Ignoring non-AssumeRole event: {event_name}")
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Not an AssumeRole event')
+        }
+    
+    # Get role ARN from request parameters
+    role_arn = detail.get('requestParameters', {}).get('roleArn', '')
+    
+    # Check if this is the role we're monitoring
+    if target_role_name not in role_arn:
+        print(f"Role {role_arn} does not match target {target_role_name}")
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Role does not match target')
+        }
+    
+    # Extract alert information
+    user_identity = detail.get('userIdentity', {})
+    request_params = detail.get('requestParameters', {})
+    
+    alert_info = {
+        'event_time': detail.get('eventTime', 'N/A'),
+        'event_id': detail.get('eventID', 'N/A'),
+        'account_id': detail.get('recipientAccountId', 'N/A'),
+        'region': detail.get('awsRegion', 'N/A'),
+        'username': user_identity.get('principalId', 'N/A').split(':')[-1],
+        'principal_id': user_identity.get('principalId', 'N/A'),
+        'user_type': user_identity.get('type', 'N/A'),
+        'arn': user_identity.get('arn', 'N/A'),
+        'role_arn': role_arn,
+        'session_name': request_params.get('roleSessionName', 'N/A'),
+        'source_ip': detail.get('sourceIPAddress', 'N/A'),
+        'user_agent': detail.get('userAgent', 'N/A')
+    }
+    
+    print(f"Alert triggered: {json.dumps(alert_info, indent=2)}")
+    
+    # Format and send alert
+    message = format_alert_message(alert_info)
+    
+    try:
+        response = sns.publish(
+            TopicArn=sns_topic_arn,
+            Subject=f'🚨 SECURITY ALERT: {target_role_name} Assumed',
+            Message=message
+        )
+        
+        print(f"SNS notification sent. MessageId: {response['MessageId']}")
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Alert sent successfully',
+                'role': role_arn,
+                'user': alert_info['username']
+            })
+        }
+        
+    except Exception as e:
+        print(f"Error sending SNS notification: {str(e)}")
+        raise
+
+def format_alert_message(alert):
+    """Format alert into a readable message"""
+    
+    message = f"""
+⚠️  SECURITY ALERT: IAM Role Assumed
+
+A user has assumed the monitored IAM role.
+
+ROLE INFORMATION:
+  Role ARN:         {alert['role_arn']}
+  Session Name:     {alert['session_name']}
+
+USER INFORMATION:
+  Username:         {alert['username']}
+  Principal ID:     {alert['principal_id']}
+  User Type:        {alert['user_type']}
+  User ARN:         {alert['arn']}
+
+EVENT DETAILS:
+  Event Time:       {alert['event_time']}
+  Event ID:         {alert['event_id']}
+  Account ID:       {alert['account_id']}
+  Region:           {alert['region']}
+  Source IP:        {alert['source_ip']}
+  User Agent:       {alert['user_agent']}
+
+ACTION REQUIRED:
+  • Verify this is authorized activity
+  • Review AWS CloudTrail for subsequent actions
+  • Contact security team if suspicious
+
+═══════════════════════════════════════════════════════════
+This is an automated alert from AWS CloudTrail monitoring
+"""
+    
+    return message.strip()
+EOF
+
+# Package Lambda function
+cd /tmp
+zip lambda_function.zip lambda_function.py
+
+LAMBDA_FUNCTION_NAME="${PREFIX}_eventbridge_monitor"
+
+aws lambda create-function \
+    --function-name $LAMBDA_FUNCTION_NAME \
+    --runtime python3.11 \
+    --role $LAMBDA_ROLE_ARN \
+    --handler lambda_function.lambda_handler \
+    --zip-file fileb:///tmp/lambda_function.zip \
+    --timeout 30 \
+    --memory-size 256 \
+    --environment Variables="{SNS_TOPIC_ARN=${SNS_TOPIC_ARN},TARGET_ROLE_NAME=${ROLE_NAME}}" \
+    --region $REGION
+
+echo "Lambda function created: $LAMBDA_FUNCTION_NAME"
+
+# ============================================
+# 9. Create EventBridge Rule for Real-Time Monitoring
+# ============================================
+echo "Creating EventBridge rule for real-time AssumeRole detection..."
+
+RULE_NAME="${PREFIX}_assumerole_rule"
+
+# Create event pattern for AssumeRole on specific role
+cat > /tmp/event-pattern.json <<EOF
+{
+  "source": ["aws.sts"],
+  "detail-type": ["AWS API Call via CloudTrail"],
+  "detail": {
+    "eventName": ["AssumeRole"],
+    "requestParameters": {
+      "roleArn": [{
+        "wildcard": "*${ROLE_NAME}*"
+      }]
+    }
+  }
+}
+EOF
+
+aws events put-rule \
+    --name $RULE_NAME \
+    --event-pattern file:///tmp/event-pattern.json \
+    --state ENABLED \
+    --region $REGION
+
+echo "EventBridge rule created: $RULE_NAME"
+
+# Add permission for EventBridge to invoke Lambda
+LAMBDA_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${LAMBDA_FUNCTION_NAME}"
+
+aws lambda add-permission \
+    --function-name $LAMBDA_FUNCTION_NAME \
+    --statement-id AllowEventBridgeInvoke \
+    --action lambda:InvokeFunction \
+    --principal events.amazonaws.com \
+    --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RULE_NAME}" \
+    --region $REGION
+
+# Add Lambda as target
+aws events put-targets \
+    --rule $RULE_NAME \
+    --targets "Id"="1","Arn"="${LAMBDA_ARN}" \
+    --region $REGION
+
+echo "EventBridge rule configured to trigger Lambda"
+
+# ============================================
+# Summary
+# ============================================
+echo ""
+echo "=========================================="
+echo "✅ POC SETUP COMPLETE!"
+echo "=========================================="
+echo ""
+echo "Resources created:"
+echo "  SNS Topic:        $SNS_TOPIC_ARN"
+echo "  S3 Bucket:        $BUCKET_NAME"
+echo "  CloudWatch Logs:  $LOG_GROUP_NAME"
+echo "  CloudTrail:       $TRAIL_NAME"
+echo "  Target Role:      arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}"
+echo "  Lambda Function:  $LAMBDA_FUNCTION_NAME"
+echo "  EventBridge Rule: $RULE_NAME"
+echo ""
+echo "📊 MONITORING SETUP:"
+echo "  Type:             REAL-TIME EventBridge (not polling)"
+echo "  Trigger:          AssumeRole events for $ROLE_NAME"
+echo "  Alert Method:     Email via SNS"
+echo "  Delay:            < 1 minute from role assumption"
+echo ""
+echo "🧪 TESTING:"
+echo "  1. Confirm your email subscription: $EMAIL"
+echo "  2. Wait 2-3 minutes for CloudTrail to initialize"
+echo "  3. Test the monitoring by assuming the role:"
+echo ""
+echo "     aws sts assume-role \\"
+echo "       --role-arn arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME} \\"
+echo "       --role-session-name poc-test-session"
+echo ""
+echo "  4. Check your email within 1-2 minutes"
+echo "  5. View Lambda logs:"
+echo "     aws logs tail /aws/lambda/${LAMBDA_FUNCTION_NAME} --follow"
+echo ""
+echo "📝 NOTES:"
+echo "  • This uses EventBridge for REAL-TIME alerts (not polling)"
+echo "  • Alerts arrive within seconds of role assumption"
+echo "  • Much more efficient than cron-based monitoring"
+echo "  • CloudTrail must deliver events to EventBridge (enabled by default)"
+echo ""
+echo "🗑️  CLEANUP (when done testing):"
+echo "  Run the cleanup script or manually delete resources"
+echo ""
+echo "=========================================="
+
+# Save configuration
+cat > /tmp/poc-config.txt <<EOF
+ACCOUNT_ID=$ACCOUNT_ID
+REGION=$REGION
+SNS_TOPIC_ARN=$SNS_TOPIC_ARN
+BUCKET_NAME=$BUCKET_NAME
+LOG_GROUP_NAME=$LOG_GROUP_NAME
+TRAIL_NAME=$TRAIL_NAME
+TEST_ROLE_ARN=arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}
+LAMBDA_FUNCTION_NAME=$LAMBDA_FUNCTION_NAME
+RULE_NAME=$RULE_NAME
+ROLE_NAME=$ROLE_NAME
+LAMBDA_ROLE_NAME=$LAMBDA_ROLE_NAME
+CLOUDTRAIL_ROLE_NAME=$CLOUDTRAIL_ROLE_NAME
+EOF
+
+echo "Configuration saved to /tmp/poc-config.txt"
